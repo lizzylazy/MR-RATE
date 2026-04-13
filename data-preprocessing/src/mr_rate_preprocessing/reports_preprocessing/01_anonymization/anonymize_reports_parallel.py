@@ -113,30 +113,30 @@ if len(df) == 0:
 # 3. Prepare Prompts for Anonymization
 # =======================================================================
 system_prompt = """
-Sen bir Turkce tibbi rapor anonimlesirme aracisin. Gorulen kisisel ve kurumsal bilgileri belirli tokenlarla degistiriyorsun.
-Yorumlama, aciklama, ozetleme, ek cumle ekleme veya format degisikligi YAPMA.
-Sadece asagidaki kurallara gore metin icindeki ilgili bilgileri tokenlarla degistir.
+Du bist ein Tool zur Anonymisierung deutscher medizinischer Berichte. Du ersetzt alle identifizierbaren persönlichen und institutionellen Informationen durch spezifische Token.
+Interpretieren, erklären, zusammenfassen oder formatieren Sie den Text NICHT neu. Fügen Sie keine Sätze hinzu.
+Ersetzen Sie nur die relevanten Informationen im Text gemäß den folgenden Regeln durch Token.
 
-# KURALLAR:
+# REGELN:
 
-## 1) KISI ISIMLERI -> Token ile degistir
-   - Hasta isimleri (tek isim veya ad+soyad): [patient_1], [patient_2], ... [patient_n]
-     Ayni hasta ismi tekrar gecerse ayni token kullanilmali.
-   - Radyolog / raporu yazan doktor isimleri: [radiologist_1], [radiologist_2], ... [radiologist_n]
-   - Sevk eden / isteyen doktor isimleri: [referring_dr_1], [referring_dr_2], ... [referring_dr_n]
-   - Diger saglik personeli (hemsire, teknisyen vb.): [staff_1], [staff_2], ... [staff_n]
-   - Isimle birlikte gelen tum unvanlar da token kapsamina alinir:
-     "Dr.", "Prof.", "Doc.", "Uzm.", "Op.", "MD", "Radyolog", "Hemsire", "Teknisyen" vb.
-     Unvan + isim birlikte tek bir token ile degistirilir.
-   - Eger bir ismin rolu (hasta mi, doktor mu) baglamdan anlasilamiyorsa [person_1], [person_2] kullan.
+## 1) PERSONENNAMEN -> Durch Token ersetzen
+   - Patientennamen (Vorname, Nachname oder beides): [patient_1], [patient_2], ... [patient_n]
+     Wenn derselbe Name erneut vorkommt, muss dasselbe Token verwendet werden.
+   - Radiologen / Erstellende Ärzte: [radiologist_1], [radiologist_2], ... [radiologist_n]
+   - Zuweisende / Überweisende Ärzte: [referring_dr_1], [referring_dr_2], ... [referring_dr_n]
+   - Sonstiges medizinisches Personal (Pflege, MTRA, Techniker): [staff_1], [staff_2], ... [staff_n]
+   - Alle Titel, die mit einem Namen erscheinen, werden in das Token eingeschlossen:
+     "Dr.", "Prof.", "Priv.-Doz.", "PD", "Dr. med.", "OA" (Oberarzt), "AA" (Assistenzarzt), "FA" (Facharzt), "Radiologe", "MTRA", "Pfleger" usw.
+     Titel + Name werden zusammen durch ein einziges Token ersetzt.
+   - Wenn die Rolle (Patient oder Arzt) nicht klar ist, verwende [person_1], [person_2].
 
-## 2) TARIHLER -> Token ile degistir
-   - Tum tarihler (gun/ay/yil, ay/yil, sadece yil dahil): [date_1], [date_2], ... [date_n]
-   - Ayni tarih tekrar gecerse ayni token kullanilmali.
-   - Ornekler: "01.03.2024" -> [date_1], "Mart 2024" -> [date_2], "2023" -> [date_3]
+## 2) DATEN -> Durch Token ersetzen
+   - Alle Daten (Tag/Monat/Jahr, Monat/Jahr, nur Jahr): [date_1], [date_2], ... [date_n]
+   - Wenn dasselbe Datum erneut vorkommt, muss dasselbe Token verwendet werden.
+   - Beispiele: "01.03.2024" -> [date_1], "März 2024" -> [date_2], "2023" -> [date_3]
 
-## 3) HASTANE ISIMLERI -> Token ile degistir
-   Asagidaki Medipol hastaneleri dahili (internal) hastanelerdir. Bunlari [hospital_1], [hospital_2], ... [hospital_n] olarak tokenla (her farkli dahili hastaneye farkli numara ver, ayni hastane tekrarlarsa ayni token kullan):
+## 3) KRANKENHAUSNAMEN -> Durch Token ersetzen
+   Die folgenden Medipol-Krankenhäuser gelten als INTERN. Ersetze sie durch [hospital_1], [hospital_2], ... [hospital_n] (Gleiches Token für gleiches Krankenhaus):
    - Medipol Mega Universitesi Hastanesi
    - Medipol Kosuyolu Hastanesi
    - Medipol Bahcelievler Universite Hastanesi
@@ -148,70 +148,60 @@ Sadece asagidaki kurallara gore metin icindeki ilgili bilgileri tokenlarla degis
    - Medipol Sefakoy Universite Hastanesi
    - Medipol Unkapani Universite Dis Hastanesi
    - Medipol Ankara Universitesi Dis Hastanesi
-   Bu isimlerin kisaltilmis, farkli yazilmis veya kismi halleri de dahildir (orn. "Medipol Mega", "Mega Hastanesi", "Medipol Universite Hastanesi").
-   Genel olarak "Medipol" iceren tum hastane isimleri dahili sayilir.
+   Dies schließt Abkürzungen oder Teilnamen ein (z. B. "Medipol Mega", "Mega Hastanesi"). Generell gelten alle Namen, die "Medipol" enthalten, als intern.
 
-   Yukaridaki listeye dahil OLMAYAN tum hastaneler harici (external) hastanelerdir.
-   Bunlari [hospital_e1], [hospital_e2], ... [hospital_en] olarak tokenla.
-## 4) Accesssion numaralari.
-    Raporlara ozel, genellikle benzersiz olan bu numaralari [accession_1], [accession_2], ... [accession_n] olarak tokenla.
+   Alle anderen Krankenhäuser, die NICHT in dieser Liste stehen, sind EXTERN.
+   Diese werden als [hospital_e1], [hospital_e2], ... [hospital_en] tokenisiert.
 
-## 5) KORUNACAK BILGILER (DEGISTIRME):
-   - Yas ve cinsiyet
-   - Tum tibbi icerik (tani, tedavi, bulgular, olcumler, ilaclar, prosedurler)
-   - Sehir / ilce / mahalle / semt isimleri
-   - Cihaz ve marka isimleri
-   - Protokol bilgileri
-   - Ilac isimleri ve dozlar
-   Bu korunacak bilgileri degistirmene gerek yok, oldugu gibi metinde birakabilirsin.
+## 4) ACCESSION-NUMMERN / AUFTRAGSNUMMERN
+    Ersetze berichtsspezifische Identifikationsnummern durch [accession_1], [accession_2], ... [accession_n].
 
-## 5) CIKTI FORMAT GEREKSINIMLERI:
-   Ciktin TAM OLARAK iki bolumden olusmalidir ve bu iki bolum "|||MAPPING|||" ayraciyla ayrilmalidir.
+## 5) ZU BEWAHRENDE INFORMATIONEN (NICHT ÄNDERN):
+   - Alter und Geschlecht
+   - Sämtlicher medizinischer Inhalt (Diagnosen, Befunde, Messwerte, Behandlungen, Medikamente, Prozeduren)
+   - Stadt- / Stadtteil- / Straßennamen (sofern nicht Teil eines Krankenhausnamens)
+   - Geräte- und Markennamen (z.B. Siemens, Philips, Skyra)
+   - Protokollinformationen
+   - Medikamentennamen und Dosierungen
+   Diese Informationen bleiben unverändert im Text stehen.
 
-   BOLUM 1: Anonimlestirilmis metin (yukaridaki kurallara gore tokenlenmis hali)
+## 6) AUSGABEFORMAT:
+   Deine Antwort MUSS EXAKT aus zwei Teilen bestehen, die durch den Trenner "|||MAPPING|||" getrennt sind.
 
-   AYRAC: |||MAPPING|||
+   TEIL 1: Anonymisierter Text (mit Token gemäß den Regeln)
 
-   BOLUM 2: Kullanilan tum tokenlarin orijinal degerlerini gosteren bir JSON nesnesi.
-   JSON formati:
+   TRENNER: |||MAPPING|||
+
+   TEIL 2: Ein JSON-Objekt, das die Originalwerte aller verwendeten Token zeigt.
+   Format:
    {
-     "[token]": "orijinal deger",
+     "[token]": "Originalwert",
      ...
    }
 
-   - Girdi metnine hicbir ek kelime, aciklama veya yorum EKLEME.
-   - Paragraf yapisi, bosluklar ve diger tum icerik oldugu gibi korunmalidir.
-   - Metni sadece BIR KERE gonder, tekrarlama.
+   - Fügen Sie dem Ausgabetext KEINE zusätzlichen Wörter, Erklärungen oder Kommentare hinzu.
+   - Absatzstruktur, Leerzeichen und alle anderen Inhalte müssen originalgetreu erhalten bleiben.
+   - Senden Sie den Text nur EINMAL, wiederholen Sie ihn nicht.
 
-# ORNEKLER:
+# BEISPIELE:
 
-Girdi:
-"Tetkik Dr. Ahmet Yilmaz tarafindan yapilmistir. Hasta Ayse Kara, 45 yasinda kadin. Tarih: 15.03.2024. Medipol Mega Universite Hastanesi."
+Eingabe:
+"Untersuchung durchgeführt von Dr. Ahmet Yilmaz. Patientin Ayse Kara, 45 Jahre alt. Datum: 15.03.2024. Medipol Mega Universite Hastanesi."
 
-Cikti:
-Tetkik [radiologist_1] tarafindan yapilmistir. Hasta [patient_1], 45 yasinda kadin. Tarih: [date_1]. [hospital_1].
+Ausgabe:
+Untersuchung durchgeführt von [radiologist_1]. Patientin [patient_1], 45 Jahre alt. Datum: [date_1]. [hospital_1].
 |||MAPPING|||
 {"[radiologist_1]": "Dr. Ahmet Yilmaz", "[patient_1]": "Ayse Kara", "[date_1]": "15.03.2024", "[hospital_1]": "Medipol Mega Universite Hastanesi"}
 
 ---
 
-Girdi:
-"Prof. Dr. Mehmet Demir raporunu hazirlamistir. Hasta daha once 10.01.2023 tarihinde Sisli Etfal Hastanesi'nde gorulmus. Kontrol: 20.05.2024, Medipol Kosuyolu Hastanesi."
+Eingabe:
+"Prof. Dr. Christian Pfirrmann hat den Befund erstellt. Der Patient wurde zuvor am 10.01.2023 im Universitätsspital Zürich untersucht. Kontrolle am 20.05.2024 im Medipol Kosuyolu Hastanesi."
 
-Cikti:
-[radiologist_1] raporunu hazirlamistir. Hasta daha once [date_1] tarihinde [hospital_e1]'nde gorulmus. Kontrol: [date_2], [hospital_1].
+Ausgabe:
+[radiologist_1] hat den Befund erstellt. Der Patient wurde zuvor am [date_1] im [hospital_e1] untersucht. Kontrolle am [date_2] im [hospital_1].
 |||MAPPING|||
-{"[radiologist_1]": "Prof. Dr. Mehmet Demir", "[date_1]": "10.01.2023", "[hospital_e1]": "Sisli Etfal Hastanesi", "[date_2]": "20.05.2024", "[hospital_1]": "Medipol Kosuyolu Hastanesi"}
-
----
-
-Girdi:
-"SONUC: Sol minimal hidroureteronefroz, sol alt ureter tasi.                                                                                             Uzm. Dr. M. Kemal Ozkan                                                                                           Radyolog"
-
-Cikti:
-SONUC: Sol minimal hidroureteronefroz, sol alt ureter tasi.                                                                                             [radiologist_1]
-|||MAPPING|||
-{"[radiologist_1]": "Uzm. Dr. M. Kemal Ozkan, Radyolog"}
+{"[radiologist_1]": "Prof. Dr. Christian Pfirrmann", "[date_1]": "10.01.2023", "[hospital_e1]": "Universitätsspital Zürich", "[date_2]": "20.05.2024", "[hospital_1]": "Medipol Kosuyolu Hastanesi"}
 """
 
 print(f"[Rank {RANK}] Preparing prompts...")
