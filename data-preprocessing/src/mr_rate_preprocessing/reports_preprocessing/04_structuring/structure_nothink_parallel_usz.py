@@ -63,6 +63,7 @@ CRITICAL: NEVER use "..." or ellipsis as a placeholder in any field. You MUST in
 
 ## Section extraction:
 - **clinical_information**: The clinical indication/history/reason for the exam. If none exists, use "".
+- **question**: Specific instruction or question a physician writes when sending a patient for a scan. If none exists, use "".
 - **technique**: The imaging technique, sequences, contrast info. Include ALL technique info (brain, cervical, thoracic, etc.). If none exists, use "".
 - **findings**: ALL observations from the report.
 - **impression**: ALL conclusions from the report.
@@ -129,7 +130,7 @@ Many reports cover multiple exams (e.g., "BRAIN MRI, CERVICAL AND THORACIC VERTE
 Return ONLY valid JSON, no preamble, no code fences.
 
 If the report contains valid radiology content:
-{"clinical_information": "...", "technique": "...", "findings": "...", "impression": "..."}
+{"question": "...", "clinical_information": "...", "technique": "...", "findings": "...", "impression": "..."}
 
 If the report is garbage (empty, placeholder only, not a radiology report):
 {"invalid": true, "reason": "brief description"}
