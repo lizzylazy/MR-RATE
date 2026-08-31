@@ -61,6 +61,67 @@ All NIfTI volumes are reoriented to **canonical RAS** (via `nibabel.as_closest_c
 | `percentile` | Clip to [0.5, 99.5] percentile, rescale to [-1,1] |
 | `minmax` | Simple min-max rescale to [-1,1] |
 
+### Offline Preprocessing (.npz cache)
+
+The coregistered/atlas NIfTIs are large (some ~2 GB) and decoding + RAS-reorient +
+resampling them on the fly starves the GPUs. `scripts/preprocess_volumes.py` runs the
+**exact** per-volume pipeline above once, offline, and writes one compact `.npz` per
+subject. Training/inference then read those directly with `--use_preprocessed`, skipping
+the expensive NIfTI read entirely.
+
+The script is independent of any dataloader/training decision: it discovers every subject
+under `--data_folder` (report/split agnostic) and keys the output only by the preprocessing
+config, which is recorded in a manifest that the loader validates.
+
+**Output layout** (consumed by both `MRReportDataset` and `MRReportDatasetInfer`):
+
+```
+<out_dir>/<space>/_manifest.json        # space, spacing, shape, posterior shift, normalizer, dtype
+<out_dir>/<space>/<study_uid>.npz       # volumes: [N, D, H, W]  (all of a subject's volumes, stacked)
+```
+
+The loader casts the cached array to bfloat16 and adds the channel dim → `[N, 1, D, H, W]`,
+**byte-for-byte identical** to the live path (verified in `tests/test_preprocess_cache.py`).
+
+**Step 1 — build the cache** (run once; resumable, shardable across array jobs):
+
+```bash
+python scripts/preprocess_volumes.py \
+    --data_folder /path/to/MR-RATE-coreg/mri \
+    --out_dir     /path/to/preprocessed \
+    --space       coreg_space \
+    --normalizer  zscore \
+    --num_workers 8
+# Shard across N jobs: add --num_shards N --shard_index $SLURM_ARRAY_TASK_ID
+```
+
+The script exposes **every** setting that affects the volume tensor, matching the
+dataloader 1:1: `--space`, `--normalizer`, `--normalizer_kwargs` (JSON, e.g.
+`'{"lower_percentile": 1.0, "upper_percentile": 99.0}'`), `--target_spacing`,
+`--target_shape`, `--posterior_shift_mm`. All are recorded in the manifest and
+checked at load time. Cache-only knobs: `--dtype {float16,float32}` (default
+`float16`, ~2× smaller), `--compress` (smaller files, slower reads — default off
+for fastest training reads). Orchestration: `--overwrite` (reprocess existing),
+`--num_workers`, `--num_shards`/`--shard_index` (split across jobs/nodes), `--limit`.
+
+> The preprocessing config passed here **must** match training (`--space`, `--normalizer`,
+> and the spacing/shape/posterior-shift defaults). The manifest captures it and the
+> dataloader refuses to train on a mismatched cache unless you pass `--cache_allow_mismatch`.
+
+**Step 2 — train/infer from the cache** (drop `--data_folder`, add the two flags):
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 scripts/run_train.py \
+    --encoder vjepa2 --fusion_mode late \
+    --space coreg_space --normalizer zscore \
+    --jsonl_file /path/to/reports.jsonl \
+    --use_preprocessed \
+    --preprocessed_dir /path/to/preprocessed
+```
+
+The same `--use_preprocessed` / `--preprocessed_dir` flags work for `inference.py` and
+`extract_features.py`.
+
 ## Repository Structure
 
 ```
@@ -80,8 +141,9 @@ contrastive-pretraining/
 ├── scripts/                  # Training, inference, and evaluation
 │   ├── run_train.py          # Training entry point (all encoder variants)
 │   ├── mr_rate_trainer.py    # Distributed trainer (accelerate, W&B, resume)
-│   ├── data.py               # MR dataset with variable volumes per subject
-│   ├── data_inference.py     # Inference dataset loader with optional labels
+│   ├── data.py               # MR dataset with variable volumes per subject (live NIfTI or .npz cache)
+│   ├── data_inference.py     # Inference dataset loader with optional labels (live NIfTI or .npz cache)
+│   ├── preprocess_volumes.py # Offline: bake the per-volume pipeline into per-subject .npz (fast disk reads)
 │   ├── inference.py          # Zero-shot brain MRI pathology classification (32 pathologies)
 │   ├── extract_features.py   # Cache frozen encoder features per split (linear-probe step 1)
 │   ├── linear_probe.py       # Train + evaluate a linear classifier on cached features (step 2)
@@ -146,20 +208,31 @@ data_folder/
 ```
 
 **Layout 2 — Batch-based** (HuggingFace dataset format):
+
+The image subdirectory name is chosen automatically from `--space`:
+
+| Space (`--space`) | Image subfolder | HuggingFace repo |
+|-------------------|-----------------|------------------|
+| `native_space` *(default)* | `img/` | [Forithmus/MR-RATE](https://huggingface.co/datasets/Forithmus/MR-RATE) |
+| `coreg_space` | `coreg_img/` | [Forithmus/MR-RATE-coreg](https://huggingface.co/datasets/Forithmus/MR-RATE-coreg) |
+| `atlas_space` | `atlas_img/` | [Forithmus/MR-RATE-atlas](https://huggingface.co/datasets/Forithmus/MR-RATE-atlas) |
+
 ```
-data_folder/
+data_folder/                       # e.g. ./data/MR-RATE-coreg/mri
 ├── batch00/
 │   ├── SUBJECT_001/
-│   │   └── img/
+│   │   └── coreg_img/             # img/ for native, atlas_img/ for atlas
 │   │       ├── SUBJECT_001_t1w-raw-axi.nii.gz
 │   │       ├── SUBJECT_001_flair-raw-axi.nii.gz
 │   │       └── ...
 │   ├── SUBJECT_002/
-│   │   └── img/
+│   │   └── coreg_img/
 │   │       └── ...
 ├── batch01/
 │   └── ...
 ```
+
+After `merge_downloaded_repos.py` consolidates native + coreg + atlas under a single tree, all three subfolders (`img/`, `coreg_img/`, `atlas_img/`) live side-by-side under each study, and `--space` selects which one to load.
 
 Reports are stored in a JSONL file with one entry per subject:
 
@@ -230,8 +303,14 @@ FUSION_MODE=late_attn POOLING_STRATEGY=cross_attn NUM_TRAIN_STEPS=50000 \
 | `--pooling_strategy` | `simple_attn`, `cross_attn`, `gated` | `simple_attn` | Volume pooling (used with `late_attn`) |
 | `--data_folder` | — | required | Path to MR data folder |
 | `--jsonl_file` | — | required | Path to reports JSONL file |
-| `--space` | — | `native_space` | Image space subfolder (only for space-based layout) |
+| `--space` | `native_space`, `coreg_space`, `atlas_space` | `native_space` | Selects the image subfolder under each study: `<space>/img/` (layout 1) or `img/` / `coreg_img/` / `atlas_img/` (layout 2) |
 | `--normalizer` | `zscore`, `percentile`, `minmax` | `zscore` | Volume normalization method |
+| `--use_preprocessed` | flag | off | Read precomputed `.npz` volumes instead of raw NIfTI (see [Offline Preprocessing](#offline-preprocessing-npz-cache)). Big I/O win for large coreg/atlas volumes. |
+| `--preprocessed_dir` | — | — | Root of the `.npz` cache (from `preprocess_volumes.py`). Required with `--use_preprocessed`. `--data_folder` becomes optional. |
+| `--cache_allow_mismatch` | flag | off | Downgrade a cache-manifest config mismatch from a hard error to a warning. |
+| `--pathology_labels_csv` | — | — | Path to pathology labels CSV (e.g. `mrrate_labels.csv`). Required for rebalancing. |
+| `--rebalance_strategy` | `inverse_freq`, `sqrt_inverse_freq`, `max_inverse_freq` | — (uniform) | Per-subject sampling weight strategy for upsampling rare pathologies. |
+| `--rebalance_base_weight` | — | `1.0` | Base sampling weight for all-negative / unlabeled subjects. |
 | `--num_train_steps` | — | `100001` | Total training steps |
 | `--lr` | — | `1e-5` | Learning rate |
 | `--results_folder` | — | `./mr_rate_results` | Checkpoint output directory |
@@ -249,6 +328,61 @@ FUSION_MODE=late_attn POOLING_STRATEGY=cross_attn NUM_TRAIN_STEPS=50000 \
 - **W&B integration**: `--wandb` logs loss, learning rate, volume count per step; run ID is persisted for seamless resume across SLURM jobs
 - **Gradient checkpointing**: Nested checkpointing at both volume level (in MRRATE) and chunk level (in sliding encoders) for maximum memory efficiency
 - **Dual checkpoints**: Saves both model-only `.pt` (for inference) and full `.pt` (model + optimizer + scheduler + step, for resume)
+- **Rare-pathology rebalancing** (see below): inverse-prevalence weighted sampling so contrastive batches see uncommon pathologies more often
+
+### Rare-Pathology Rebalancing
+
+Pathology prevalence in MR-RATE is heavily skewed (~43% of studies are all-negative; the rarest pathology, *Hemangioma of vertebral column*, occurs in ~0.23% of studies; *Gliosis* in ~37%). Under uniform sampling, contrastive batches are dominated by common findings and the model rarely sees rare ones. Passing `--pathology_labels_csv` together with `--rebalance_strategy` switches the training DataLoader to a `WeightedRandomSampler` whose per-subject weights are derived from inverse prevalence.
+
+#### How the weighting works
+
+Each subject's report is **multi-label** — a single scan can have zero, one, or many positive pathologies. Every subject is reduced to a single sampling weight `w_i`. Bigger weight = drawn more often. The three strategies differ in how a subject's binary label vector is collapsed into that one number.
+
+Concrete walk-through with two pathologies and three subjects (using real prevalences from `mrrate_labels.csv`: *Hemangioma of vertebral column* ≈ 0.23% → inv-freq ≈ 433; *Gliosis* ≈ 37% → inv-freq ≈ 2.7):
+
+| Subject | Hemangioma (rare) | Gliosis (common) | `inverse_freq` weight |
+|---------|-------------------|------------------|-----------------------|
+| A       | 1                 | 1                | `1 + 433 + 2.7 ≈ 436.7` |
+| B       | 0                 | 1                | `1 +   0 + 2.7 ≈ 3.7`   |
+| C       | 0                 | 0                | `1` (base)              |
+
+Subject A is drawn ~436× more often than C, and ~118× more often than B.
+
+#### Strategy choice
+
+For each pathology `p`, `prevalence[p]` is the positive rate across labeled subjects in the active split, and `inv_freq[p] = 1 / max(prevalence[p], eps)`. The three strategies are different ways to aggregate across a subject's positive labels:
+
+| Strategy | Formula | Subject A's weight | Behavior |
+|----------|---------|--------------------|----------|
+| `inverse_freq` | `base + Σ_p y_p · inv_freq[p]` | `436.7` | **Sum** — rewards multiple co-occurring rare findings. On `mrrate_labels.csv`, rarest pathology mass: 0.23% → ~4.0% (~17× boost). |
+| `sqrt_inverse_freq` | `base + Σ_p y_p · √inv_freq[p]` | `22.4` | Sum with diminishing returns. Rarest pathology mass: 0.23% → ~1.5%. Use when `inverse_freq` over-amplifies. |
+| `max_inverse_freq` | `max(base, max_p y_p · inv_freq[p])` | `433` | **Max** — a subject's weight is set by its single rarest positive pathology. Doesn't matter if they have one rare finding or five — caps combinatorial blow-up. |
+
+Recommendation: start with `inverse_freq`. Switch to `sqrt_inverse_freq` if training loss gets noisy from over-sampling the same handful of rare subjects.
+
+Subjects missing from the labels CSV — and all-negative subjects — receive `--rebalance_base_weight` (default `1.0`), so they remain in the pool but do not dominate it.
+
+#### Enabling it
+
+Add two flags to your existing training command:
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 scripts/run_train.py \
+    --encoder vjepa2 --fusion_mode late \
+    --data_folder /path/to/data \
+    --jsonl_file  /path/to/reports.jsonl \
+    --pathology_labels_csv /path/to/mrrate_labels.csv \
+    --rebalance_strategy inverse_freq
+```
+
+Without those flags, nothing changes — uniform `shuffle=True` as before. With them, the dataset prints a one-line summary at startup so you can verify the math:
+
+```
+[MRReportDataset] Rebalancing enabled (strategy=inverse_freq): 97896/97896 subjects matched labels CSV, weight range=[1.0, 1418.9], mean=33.0
+[Trainer] Using WeightedRandomSampler (strategy=inverse_freq)
+```
+
+Total compute is unchanged (still `--num_train_steps` steps × batch_size × num_processes draws). Rebalancing only **redistributes** that draw budget toward rare-pathology subjects via `WeightedRandomSampler(..., replacement=True)`.
 
 ### Training Configuration
 
@@ -362,15 +496,22 @@ Column names must match the pathology labels in `--pathologies_file`. The pre-co
 | `--fusion_mode` | required | Fusion mode used during training |
 | `--pooling_strategy` | `simple_attn` | Pooling strategy used during training |
 | `--weights_path` | required | Path to model checkpoint |
-| `--data_folder` | required | Path to MR data folder |
+| `--data_folder` | required* | Path to MR data folder (*optional if `--use_preprocessed`) |
 | `--jsonl_file` | required | Path to reports JSONL file |
 | `--normalizer` | `zscore` | Volume normalization method |
+| `--use_preprocessed` | off | Read precomputed `.npz` instead of raw NIfTI (see [Offline Preprocessing](#offline-preprocessing-npz-cache)) |
+| `--preprocessed_dir` | — | Root of the `.npz` cache; required with `--use_preprocessed` |
+| `--cache_allow_mismatch` | off | Downgrade a cache-manifest config mismatch to a warning |
 | `--batch_size` | `1` | Inference batch size |
 | `--results_folder` | `./inference_results` | Output directory |
 | `--labels_file` | required | Path to labels CSV (study_uid + binary pathology columns) |
 | `--splits_csv` | — | Path to splits CSV (columns: study_uid, split) |
 | `--split` | `test` | Which split to evaluate |
 | `--pathologies_file` | required | Pathologies JSON with positive/negative prompts (see format above) |
+
+> `extract_features.py` accepts the same `--use_preprocessed` / `--preprocessed_dir` /
+> `--cache_allow_mismatch` flags, so linear-probe feature caching can read from the
+> `.npz` cache too.
 
 ### Outputs
 
@@ -386,12 +527,23 @@ Column names must match the pathology labels in `--pathologies_file`. The pre-co
 
 A supervised baseline that freezes the pretrained MR-RATE encoder and trains only a linear classifier on top of its pooled visual features. This is the standard probe used to measure how well the contrastive representation captures the downstream pathology labels, separate from the zero-shot prompt quality.
 
-The probe is two scripts run in order:
+The probe is two (optionally three) scripts run in order:
 
 1. **`extract_features.py`** — encode every subject once with the frozen encoder and dump features to disk. This is the slow step; it runs the same model + preprocessing path as `inference.py`. Run it once per split.
 2. **`linear_probe.py`** — train `nn.Linear(dim_latent, num_classes)` with `BCEWithLogitsLoss` on the cached features, pick the best epoch by val mean-AUROC, report test metrics through `eval.evaluate_internal` (identical AUROC pipeline to inference).
+3. **`relabel_features.py`** *(optional)* — swap in a different label set on top of already-cached features **without re-encoding**. See [Reusing features for a different label set](#reusing-features-for-a-different-label-set-no-re-extract).
 
-Why precompute features: the 3D encoder is the expensive part. Once it is frozen, every training epoch sees the same features, so running the encoder once and then training the linear head on cached `.npy` files is orders of magnitude faster than re-encoding each epoch — the standard CLIP / SimCLR / DINO linear-probe recipe.
+Why precompute features: the 3D encoder is the expensive part. Once it is frozen, every training epoch sees the same features, so running the encoder once and then training the linear head on cached `.npy` files is orders of magnitude faster than re-encoding each epoch — the standard CLIP / SimCLR / DINO linear-probe recipe. The corollary: **the labels are not part of the features**, so changing the label set never requires re-extraction — only the cheap `linear_probe.py` step is repeated (see step 3).
+
+### Label sets
+
+The class count is **derived from the labels CSV at runtime** — `extract_features.py` sets `num_classes = len(label_columns)` and writes `label_names.json` from the CSV header, and `linear_probe.py` sizes `nn.Linear(dim, n_classes)` from that. Nothing is hardcoded, so any labels CSV (`study_uid` + binary class columns) is a drop-in `--labels_file` with no code change. The ready-made set lives under `scripts/eval_labels/`:
+
+| Folder | Classes | Ground-truth rule |
+|--------|--------:|-------------------|
+| `splits_merged_majority/` (`mrrate_merged_labels.csv`) | 14 | 3-model majority (Claude Opus 4.7 + GPT-5.5 + Nemotron-3 Super 120B; positive when ≥2 of the available votes agree), then collapsed into the neuroradiologist's clinical groups (8 pathophysiology `PP_*` + 6 imaging-phenotype `BP_*`) |
+
+It pairs a labels CSV (`study_uid` + 14 binary class columns) with a `splits.csv` (`study_uid,split`). Reproduce it with `scripts/eval_labels/build_merged_group_labels.py --source majority` (the script also supports `--source {raw,csv32}` for 2-model agreement variants if you need them).
 
 ### Step 1 — Cache features
 
@@ -449,9 +601,137 @@ Outputs in `--results_dir`:
 
 The best epoch by val mean-AUROC is restored before test evaluation. Single-class columns (all 0 or all 1 in the test split) are gracefully reported as `NaN` and excluded from the macro mean.
 
+## Frozen-encoder MIL probing
+
+MIL keeps the visual encoder frozen and trains only a gated
+Classify-Then-Aggregate head. Unlike linear probing, which uses one pooled vector
+per study, MIL operates on the projected visual tokens from every valid series.
+
+Two execution modes are available:
+
+| Mode | Token embeddings | Best use |
+|------|------------------|----------|
+| Cached MIL | Written once as ragged per-study bags | Repeated experiments and faster training |
+| Online MIL | Recomputed each epoch and discarded | Limited storage or one-off experiments |
+
+The encoder configuration must match the contrastive checkpoint, including
+`--encoder`, `--fusion_mode`, `--pooling_strategy`, and `--dim_latent`. MIL
+requires `--fusion_mode late` so valid series remain separate before their tokens
+are concatenated into each study bag. Add `--extra_latent_projection` when that
+projection was used during contrastive pretraining.
+
+### Cached MIL
+
+Extract token-level features for every split:
+
+```bash
+WEIGHTS=/path/to/model_checkpoint.pt
+DATA=/path/to/mri
+REPORTS=/path/to/reports.jsonl
+LABELS=/path/to/labels.csv
+SPLITS=/path/to/splits.csv
+FEATURES=/path/to/mil_features
+
+for SPLIT in train val test; do
+  python scripts/extract_features.py \
+    --weights_path "$WEIGHTS" \
+    --encoder vjepa2 \
+    --fusion_mode late \
+    --pooling_strategy simple_attn \
+    --dim_latent 512 \
+    --data_folder "$DATA" \
+    --jsonl_file "$REPORTS" \
+    --labels_file "$LABELS" \
+    --splits_csv "$SPLITS" \
+    --split "$SPLIT" \
+    --normalizer zscore \
+    --feature_level tokens \
+    --cache_dtype float16 \
+    --out_dir "$FEATURES"
+done
+```
+
+Train and evaluate the MIL head:
+
+```bash
+python scripts/mil_probe.py \
+  --features_dir "$FEATURES" \
+  --results_dir /path/to/mil_results \
+  --epochs 50 \
+  --batch_size 4
+```
+
+Cached MIL stores all retained token embeddings plus study offsets and provenance.
+The pooled `features_<split>.npy` files used by the linear probe cannot be reused
+for MIL. To bound cache size, add `--max_tokens_per_study 2048` during extraction.
+Leaving it at `0` retains every token; any positive limit is deterministic
+subsampling.
+
+### Online MIL without a token cache
+
+Online MIL reconstructs the same frozen encoder and sends each study's tokens
+directly to the same MIL head:
+
+```bash
+python scripts/mil_probe_online.py \
+  --weights_path "$WEIGHTS" \
+  --encoder vjepa2 \
+  --fusion_mode late \
+  --data_folder "$DATA" \
+  --jsonl_file "$REPORTS" \
+  --labels_file "$LABELS" \
+  --splits_csv "$SPLITS" \
+  --results_dir /path/to/mil_online_results \
+  --epochs 50 \
+  --grad_accum_steps 4
+```
+
+The encoder remains in evaluation mode, runs under `torch.no_grad()`, and is
+excluded from the optimizer. Token embeddings are discarded after each study and
+are never written to disk. This avoids the token-cache storage cost but repeats
+encoder computation every epoch.
+
+Studies are encoded one at a time because their numbers of series differ.
+`--grad_accum_steps` provides a larger effective head-training batch size.
+`--max_tokens_per_study` can reduce MIL-head memory after encoding but does not
+reduce encoder computation. Preprocessed image inputs remain supported through
+`--use_preprocessed --preprocessed_dir /path/to/preprocessed`.
+
+Both modes select checkpoints and class thresholds using validation data only,
+then evaluate the fixed model and thresholds on the test split.
+
+### Reusing features for a different label set (no re-extract)
+
+Because labels are not baked into the encoder features, you only ever run `extract_features.py` **once**. To probe a different label CSV — a different ground-truth rule, or a different grouping — relabel the cached features instead of re-encoding:
+
+```bash
+# (once) cache features
+for SPLIT in train val test; do
+  python scripts/extract_features.py \
+      --encoder vjepa2 --fusion_mode late --pooling_strategy simple_attn \
+      --weights_path ./mr_rate_results/MrRate.5000.pt \
+      --data_folder /path/to/data --jsonl_file /path/to/reports.jsonl \
+      --labels_file scripts/eval_labels/splits_merged_majority/mrrate_merged_labels.csv \
+      --splits_csv  scripts/eval_labels/splits_merged_majority/splits.csv \
+      --split $SPLIT --normalizer zscore --out_dir ./lp_features
+done
+
+# train the head on those features
+python scripts/linear_probe.py --features_dir ./lp_features --results_dir ./lp_results
+
+# later: probe ANY other labels CSV on the SAME features — instant, no encoder pass
+python scripts/relabel_features.py \
+    --features_dir ./lp_features \
+    --labels_file  /path/to/other_labels.csv \
+    --out_dir      ./lp_features_other
+python scripts/linear_probe.py --features_dir ./lp_features_other --results_dir ./lp_results_other
+```
+
+`relabel_features.py` symlinks `features_<split>.npy` + `subject_ids_<split>.txt` from `--features_dir` and rebuilds only `labels_<split>.npy` (in the exact subject order of the source) and `label_names.json` from `--labels_file`. If a cached subject is missing from the new labels CSV it **errors out** rather than silently misaligning rows. Use `--copy` to copy the feature files instead of symlinking (e.g. to move the dir to another machine).
+
 ### Notes
 
-- Both scripts are single-process. The linear head is `Linear(512, 32) ≈ 16K params` over ~180 MB of cached features — DDP overhead would dominate. For feature extraction, shard externally by running one job per split, or by splitting `splits.csv` into chunks and concatenating the resulting `.npy` files.
+- Both scripts are single-process. The linear head is tiny — `Linear(512, num_classes)`, e.g. ~16K params for 32 classes or ~7K for the 14 merged groups — over ~180 MB of cached features, so DDP overhead would dominate. For feature extraction, shard externally by running one job per split, or by splitting `splits.csv` into chunks and concatenating the resulting `.npy` files.
 - `--encoder`, `--fusion_mode`, `--pooling_strategy`, and `--dim_latent` must match the values used when the checkpoint was trained; if they don't, `_load_and_verify` will surface it loudly instead of silently loading garbage.
 
 ## Testing
@@ -474,6 +754,7 @@ python -m pytest --no-cov
 |------|-------|----------|
 | `test_imports.py` | Dependency + package import verification | All imports |
 | `test_data.py` | Normalizers (zscore, percentile, minmax), collate_fn | Data pipeline |
+| `test_preprocess_cache.py` | discover_subjects, preprocess_volumes.py, live↔cache equivalence, manifest guard | `.npz` cache |
 | `test_pooling.py` | SimpleAttnPool, CrossAttnPool, GatedAttnPool | Shapes, masking, gradients |
 | `test_mr_rate_model.py` | MRRATE model init, forward, loss, serialization | 95% of core model |
 | `test_fusion_modes.py` | All 4 fusion modes x all pooling strategies | End-to-end forward pass |
