@@ -51,6 +51,10 @@ from transformers import AutoTokenizer
 parser = argparse.ArgumentParser()
 parser.add_argument("--input_file", type=str, required=True)
 parser.add_argument("--output_dir", type=str, default="validation_shards")
+parser.add_argument("--model", type=str,
+                    default=os.environ.get("MR_RATE_REPORTS_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8"),
+                    help="HuggingFace model ID or path to a local model directory "
+                         "(env: MR_RATE_REPORTS_MODEL)")
 args = parser.parse_args()
 
 RANK = int(os.environ.get("SLURM_PROCID", "0"))
@@ -61,9 +65,9 @@ print(f"[Rank {RANK}/{WORLD_SIZE}] Starting on node {os.environ.get('SLURMD_NODE
 # =======================================================================
 # 1. Load Model with vLLM
 # =======================================================================
-model_dir = "Qwen/Qwen3.5-35B-A3B-FP8"
+model_dir = args.model
 
-print(f"[Rank {RANK}] Loading model with vLLM engine...")
+print(f"[Rank {RANK}] Loading model {model_dir} with vLLM engine...")
 llm = LLM(
     model=model_dir,
     trust_remote_code=True,

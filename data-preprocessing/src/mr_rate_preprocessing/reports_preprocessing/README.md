@@ -8,6 +8,28 @@ End-to-end pipeline for processing Turkish brain MRI radiology reports: anonymiz
 - **Batches**: batch00-batch27 across three collection periods
 - **Model**: Qwen3.5-35B-A3B-FP8 via vLLM for all LLM steps
 
+## Model Selection
+
+All LLM steps default to `Qwen/Qwen3.5-35B-A3B-FP8` but accept any HuggingFace
+model ID or a path to a locally downloaded model directory:
+
+```bash
+# Per run
+srun python 02_translation/translate_reports_parallel.py \
+    --input_file anonymized.csv \
+    --model /path/to/local/Qwen3.5-35B-A3B-FP8
+
+# Or for the whole pipeline
+export MR_RATE_REPORTS_MODEL=/path/to/local/Qwen3.5-35B-A3B-FP8
+```
+
+Precedence: `--model` > `MR_RATE_REPORTS_MODEL` > default. Applies to steps
+01-05 and `utils/validate_anonymization_parallel.py`; steps 06 and 07 use their
+own `--model_name` flag.
+
+Running fully offline (no hub lookups) additionally needs `HF_HUB_OFFLINE=1`
+and a model directory that contains the tokenizer files.
+
 ## Pipeline Overview
 
 Each step follows an iterative **run → QC → retry → re-QC** loop until quality thresholds are met.
