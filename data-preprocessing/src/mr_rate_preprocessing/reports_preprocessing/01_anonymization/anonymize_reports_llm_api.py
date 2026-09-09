@@ -1,0 +1,288 @@
+# =======================================================================
+# Parallel Qwen Anonymization Script for Turkish Reports
+# Each SLURM task processes its shard of the data on its own GPU.
+# =======================================================================
+import concurrent.futures
+import os
+import json
+
+import argparse
+import pandas as pd
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+from mr_rate_preprocessing.reports_preprocessing.llm import fetch_llm_response
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_file", type=str, default="merged_filtered_with_uid.csv")
+    parser.add_argument("--output_dir", type=str, default="anonymized_shards")
+    args = parser.parse_args()
+
+    # =======================================================================
+    # 2. Load Turkish Reports and shard
+    # =======================================================================
+    input_file = args.input_file
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_file = os.path.join(output_dir, f"anonymized_rank_.csv")
+    mapping_file = os.path.join(output_dir, f"mapping_rank_.csv")
+
+    print(f"[Rank ] Reading CSV file: {input_file}")
+    df = pd.read_csv(input_file, encoding="utf-8-sig", sep=';')
+    df['AccessionNo'] = df['AccNr'].str.split('-').str[0]
+    df['RaporText'] = df['Rumpf']
+    if not {"AccessionNo", "RaporText"}.issubset(df.columns):
+        raise ValueError("CSV must contain 'AccessionNo' and 'RaporText' columns.")
+
+    total_reports = len(df)
+    print(f"[Rank ] Total reports: {total_reports}, this shard: {len(df)}")
+
+    # Resume support: skip already-processed rows
+    if os.path.exists(output_file):
+        done_df = pd.read_csv(output_file, usecols=["AccessionNo"])
+        done_accessions = set(done_df["AccessionNo"].astype(str))
+        mask = ~df["AccessionNo"].astype(str).isin(done_accessions)
+        df = df[mask].reset_index(drop=True)
+        print(f"[Rank ] Resuming: {len(done_accessions)} already done, {len(df)} remaining.")
+
+    if len(df) == 0:
+        print(f"[Rank ] All reports already processed.")
+        exit(0)
+
+    # =======================================================================
+    # 3. Prepare Prompts for Anonymization
+    # =======================================================================
+    system_prompt = """
+    Du bist ein Tool zur Anonymisierung deutscher medizinischer Berichte. Du ersetzt alle identifizierbaren persönlichen und institutionellen Informationen durch spezifische Token.
+    Interpretieren, erklären, zusammenfassen oder formatieren Sie den Text NICHT neu. Fügen Sie keine Sätze hinzu.
+    Ersetzen Sie nur die relevanten Informationen im Text gemäß den folgenden Regeln durch Token.
+    
+    # REGELN:
+    
+    ## 1) PERSONENNAMEN -> Durch Token ersetzen
+       - Patientennamen (Vorname, Nachname oder beides): [patient_1], [patient_2], ... [patient_n]
+         Wenn derselbe Name erneut vorkommt, muss dasselbe Token verwendet werden.
+       - Radiologen / Erstellende Ärzte: [radiologist_1], [radiologist_2], ... [radiologist_n]
+       - Zuweisende / Überweisende Ärzte: [referring_dr_1], [referring_dr_2], ... [referring_dr_n]
+       - Sonstiges medizinisches Personal (Pflege, MTRA, Techniker): [staff_1], [staff_2], ... [staff_n]
+       - Alle Titel, die mit einem Namen erscheinen, werden in das Token eingeschlossen:
+         "Dr.", "Prof.", "Priv.-Doz.", "PD", "Dr. med.", "OA" (Oberarzt), "AA" (Assistenzarzt), "FA" (Facharzt), "Radiologe", "MTRA", "Pfleger" usw.
+         Titel + Name werden zusammen durch ein einziges Token ersetzt.
+       - Wenn die Rolle (Patient oder Arzt) nicht klar ist, verwende [person_1], [person_2].
+    
+    ## 2) DATEN -> Durch Token ersetzen
+       - Alle Daten (Tag/Monat/Jahr, Monat/Jahr, nur Jahr): [date_1], [date_2], ... [date_n]
+       - Wenn dasselbe Datum erneut vorkommt, muss dasselbe Token verwendet werden.
+       - Beispiele: "01.03.2024" -> [date_1], "März 2024" -> [date_2], "2023" -> [date_3]
+    
+    ## 3) KRANKENHAUSNAMEN -> Durch Token ersetzen
+       Die folgenden Krankenhäuser gelten als INTERN. Ersetze sie durch [hospital_1], [hospital_2], ... [hospital_n] (Gleiches Token für gleiches Krankenhaus):
+       - USZ
+       - Universitätsspital Zürich 
+       - University Hospital Zurich
+    
+       Alle anderen Krankenhäuser, die NICHT in dieser Liste stehen, sind EXTERN.
+       Diese werden als [hospital_e1], [hospital_e2], ... [hospital_en] tokenisiert.
+    
+    ## 4) ACCESSION-NUMMERN / AUFTRAGSNUMMERN
+        Ersetze berichtsspezifische Identifikationsnummern durch [accession_1], [accession_2], ... [accession_n].
+    
+    ## 5) ZU BEWAHRENDE INFORMATIONEN (NICHT ÄNDERN):
+       - Alter und Geschlecht
+       - Sämtlicher medizinischer Inhalt (Diagnosen, Befunde, Messwerte, Behandlungen, Medikamente, Prozeduren)
+       - Stadt- / Stadtteil- / Straßennamen (sofern nicht Teil eines Krankenhausnamens)
+       - Geräte- und Markennamen (z.B. Siemens, Philips, Skyra)
+       - Protokollinformationen
+       - Medikamentennamen und Dosierungen
+       Diese Informationen bleiben unverändert im Text stehen.
+    
+    ## 6) AUSGABEFORMAT:
+       Deine Antwort MUSS EXAKT aus zwei Teilen bestehen, die durch den Trenner "|||MAPPING|||" getrennt sind.
+    
+       TEIL 1: Anonymisierter Text (mit Token gemäß den Regeln)
+    
+       TRENNER: |||MAPPING|||
+    
+       TEIL 2: Ein JSON-Objekt, das die Originalwerte aller verwendeten Token zeigt.
+       Format:
+       {
+         "[token]": "Originalwert",
+         ...
+       }
+    
+       - Fügen Sie dem Ausgabetext KEINE zusätzlichen Wörter, Erklärungen oder Kommentare hinzu.
+       - Absatzstruktur, Leerzeichen und alle anderen Inhalte müssen originalgetreu erhalten bleiben.
+       - Senden Sie den Text nur EINMAL, wiederholen Sie ihn nicht.
+    
+    # BEISPIELE:
+    
+    Eingabe:
+    "Untersuchung durchgeführt von Dr. Ahmet Yilmaz. Patientin Ayse Kara, 45 Jahre alt. Datum: 15.03.2024. Universitätsspital Zürich."
+    
+    Ausgabe:
+    Untersuchung durchgeführt von [radiologist_1]. Patientin [patient_1], 45 Jahre alt. Datum: [date_1]. [hospital_1].
+    |||MAPPING|||
+    {"[radiologist_1]": "Dr. Ahmet Yilmaz", "[patient_1]": "Ayse Kara", "[date_1]": "15.03.2024", "[hospital_1]": "MUniversitätsspital Zürich"}
+    
+    ---
+    
+    Eingabe:
+    "Prof. Dr. Christian Pfirrmann hat den Befund erstellt. Der Patient wurde zuvor am 10.01.2023 im Universitätsspital Zürich untersucht. Kontrolle am 20.05.2024 im Universitätsspital Zürich."
+    
+    Ausgabe:
+    [radiologist_1] hat den Befund erstellt. Der Patient wurde zuvor am [date_1] im [hospital_e1] untersucht. Kontrolle am [date_2] im [hospital_1].
+    |||MAPPING|||
+    {"[radiologist_1]": "Prof. Dr. Christian Pfirrmann", "[date_1]": "10.01.2023", "[hospital_e1]": "Universitätsspital Zürich", "[date_2]": "20.05.2024", "[hospital_1]": "Universitätsspital Zürich"}
+    """
+
+    print(f"[Rank ] Preparing prompts...")
+
+    reports_list = df["RaporText"].tolist()
+    # =======================================================================
+    # 4. Batched Processing
+    # =======================================================================
+    CHUNK_SIZE = 5
+    MAX_TOK = 30000
+
+    print(f"[Rank ] Running anonymization ({len(df)} reports)...")
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=MAX_TOK
+    )
+
+    # =======================================================================
+    # 4b. Parse outputs
+    # =======================================================================
+    MAPPING_DELIMITER = "|||MAPPING|||"
+
+
+    def extract_anonymized_and_mapping(text):
+        text = text.strip()
+
+        if "</think>" in text:
+            text = text.split("</think>")[-1].strip()
+
+        prefixes_to_remove = [
+            "Iste anonimlestirilmis metin:",
+            "Anonimlestirilmis metin:",
+            "Cikti:",
+            "Iste cikti:",
+            "Anonimlestirilmis rapor:",
+            "Sonuc:",
+            "Here is the anonymized text:",
+            "Anonymized text:",
+            "Output:",
+        ]
+        for prefix in prefixes_to_remove:
+            if text.lower().startswith(prefix.lower()):
+                text = text[len(prefix):].strip()
+
+        anonymized_text = text
+        mapping_dict = {}
+        mapping_json = "{}"
+
+        if MAPPING_DELIMITER in text:
+            parts = text.split(MAPPING_DELIMITER, 1)
+            anonymized_text = parts[0].strip()
+            raw_mapping = parts[1].strip()
+
+            try:
+                json_start = raw_mapping.find("{")
+                json_end = raw_mapping.rfind("}") + 1
+                if json_start != -1 and json_end > json_start:
+                    json_str = raw_mapping[json_start:json_end]
+                    mapping_dict = json.loads(json_str)
+                    mapping_json = json.dumps(mapping_dict, ensure_ascii=False)
+            except json.JSONDecodeError:
+                mapping_json = raw_mapping
+                mapping_dict = {}
+
+        return anonymized_text, mapping_dict, mapping_json
+
+
+    # =======================================================================
+    # 5. Process in chunks with checkpointing
+    # =======================================================================
+    save_cols = ["AccessionNo", "UID", "Batch", "KabulTarihi", "TetkikAdi",
+                 "RaporText", "Anonymized_Rapor", "Token_Mapping"]
+    save_cols = [c for c in save_cols if c in df.columns or c in ("Anonymized_Rapor", "Token_Mapping")]
+
+    total_processed = 0
+    sampling_params = SamplingParams(
+        temperature=0.1,
+        max_tokens=MAX_TOK,
+    )
+
+#
+    messages = [[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": f"{report}"
+                }
+            ]
+        for report in reports_list
+    ]
+    for chunk_start in range(0, len(df), CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, len(df))
+        chunk_df = df.iloc[chunk_start:chunk_end].copy()
+        chunk_prompts = messages[chunk_start:chunk_end]
+
+        print(f"[Rank ] Processing chunk {chunk_start}-{chunk_end} / {len(df)}...")
+        outputs = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            outputs = list(
+                executor.map(
+                    lambda msg: fetch_llm_response(msg, sampling_params),
+                    messages,
+                )
+            )
+        all_anonymized = []
+        all_mappings_json = []
+        mapping_rows = []
+
+        for i, output in enumerate(outputs):
+            anon_text, m_dict, m_json = extract_anonymized_and_mapping(output)
+            all_anonymized.append(anon_text)
+            all_mappings_json.append(m_json)
+
+            accession = chunk_df.iloc[i]["AccessionNo"]
+            if isinstance(m_dict, dict) and m_dict:
+                for token, original in m_dict.items():
+                    mapping_rows.append({
+                        "AccessionNo": accession,
+                        "token": token,
+                        "original_value": original
+                    })
+            else:
+                mapping_rows.append({
+                    "AccessionNo": accession,
+                    "token": "NO_MAPPING_EXTRACTED",
+                    "original_value": ""
+                })
+
+        chunk_df["Anonymized_Rapor"] = all_anonymized
+        chunk_df["Token_Mapping"] = all_mappings_json
+
+        result_cols = [c for c in save_cols if c in chunk_df.columns]
+        result_chunk = chunk_df[result_cols]
+
+        write_header = not os.path.exists(output_file)
+        result_chunk.to_csv(output_file, mode="a", index=False, header=write_header, encoding="utf-8-sig")
+
+        mapping_chunk_df = pd.DataFrame(mapping_rows)
+        write_header_map = not os.path.exists(mapping_file)
+        mapping_chunk_df.to_csv(mapping_file, mode="a", index=False, header=write_header_map, encoding="utf-8-sig")
+
+        total_processed += len(chunk_df)
+        print(f"[Rank ] Saved chunk ({total_processed}/{len(df)} total).")
+
+    print(f"[Rank ] Done. Processed {total_processed} reports -> {output_file}")
+
+
+
+
+
