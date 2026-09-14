@@ -3,8 +3,8 @@ import requests
 # API Configuration
 # -----------------------------------------------------------------------
 
-API_URL = "http://vl90864.usz.ch:8001/v1/chat/completions"
-MODEL_NAME = "gpt-oss-20b"
+API_URL = "http://localhost:8000/v1/chat/completions"
+MODEL_NAME = "Qwen/Qwen3.5-35B-A3B-FP8"
 
 session = requests.Session()
 
@@ -13,10 +13,11 @@ def fetch_llm_response(messages, sampling_params):
     """
     Sends a request to a local OpenAI-compatible API.
     """
-    if hasattr(sampling_params, "__dict__"):
-        params_dict = sampling_params.__dict__
-    else:
-        params_dict = sampling_params
+    params_dict = {
+        "temperature": sampling_params.temperature,
+        "top_p": sampling_params.top_p,
+        "max_tokens": sampling_params.max_tokens,
+    }
 
     payload = {
         "model": MODEL_NAME,
