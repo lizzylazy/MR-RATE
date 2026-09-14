@@ -30,6 +30,7 @@ Example Usage:
 """
 
 import argparse
+import ast
 import json
 import logging
 import sys
@@ -153,8 +154,11 @@ def get_acquisition_plane(iop_value, oblique_threshold: float = 0.9) -> str:
         return "UNKNOWN"
     
     try:
-        iop_str = str(iop_value)
-        vals = [float(v) for v in iop_str.replace('\\', ',').split(',')]
+        # iop_str = str(iop_value)
+        # vals = [float(v) for v in iop_str.replace('\\', ',').split(',')]
+        # change to this because usz data is already a string representation of a Python list
+        vals = np.asarray(ast.literal_eval(iop_value), dtype=float)
+
         if len(vals) == 6:
             row_vec = np.array(vals[0:3])
             col_vec = np.array(vals[3:6])
@@ -619,31 +623,35 @@ Examples:
     parser.add_argument(
         "--raw-data-dir", "-d",
         type=Path,
-        required=True,
+        #required=True,
+        default='/home/USZ/zhliracc/data/mr_rate/mr_brain_6445959_nii',
         help="Path to raw MRI data directory (contains study folders with NIfTI files)",
     )
     
     parser.add_argument(
         "--classified-csv", "-c",
         type=Path,
-        required=True,
+        #required=True,
+        default='/home/USZ/zhliracc/data/mr_rate/6445959_metadata/6445959_raw_metadata_classified.csv',
         help="Path to classified metadata CSV (output of series_classification.py)",
     )
     
     parser.add_argument(
         "--output-json", "-oj",
         type=Path,
-        required=True,
+        #required=True,
+        default='/home/USZ/zhliracc/data/mr_rate/6445959_metadata/6445959_modalities_to_process.json',
         help="Output JSON file path (modalities to process)",
     )
     
     parser.add_argument(
         "--output-csv", "-oc",
         type=Path,
-        required=True,
+        #required=True,
+        default='/home/USZ/zhliracc/data/mr_rate/6445959_metadata/6445959_modalities_to_process_metadata.csv',
         help="Output CSV file path (filtered metadata with image properties)",
     )
-    
+
     parser.add_argument(
         "--num-processes", "-n",
         type=int,
