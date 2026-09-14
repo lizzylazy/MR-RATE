@@ -12,9 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 # API Configuration
 # -----------------------------------------------------------------------
 
-API_URL = "http://vl90864.usz.ch:8001/v1/chat/completions"
-MODEL_NAME = "gpt-oss-120b"
-
+API_URL = "http://localhost:8000/v1/chat/completions"
+MODEL_NAME = "Qwen/Qwen3.5-35B-A3B-FP8"
 # -----------------------------------------------------------------------
 # Original System Prompt
 # -----------------------------------------------------------------------
@@ -92,7 +91,7 @@ def translate_single(report: str) -> str:
             },
         ],
         "temperature": 0.0,
-        "max_tokens": 2048,
+        "max_tokens": 30000,
     }
 
     try:
@@ -142,28 +141,10 @@ def main():
         description="Translate anonymized medical reports using vLLM API."
     )
 
-    parser.add_argument(
-        "--input_file",
-        type=str,
-        default='/data/zhliracc/data/mr_rate_data/patient_report.csv',
-        help="Input CSV file",
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="translated_shards",
-        help="Output directory",
-    )
-
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        help="Number of concurrent API requests",
-    )
-
+    parser.add_argument("--input_file", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="translated_shards")
     args = parser.parse_args()
+
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -177,7 +158,7 @@ def main():
     df = pd.read_csv(
         args.input_file,
         encoding="utf-8-sig",
-        sep=";",
+        sep=",",
     )
 
     if "Anonymized_Rapor" not in df.columns:
@@ -186,12 +167,6 @@ def main():
             "Using 'Rumpf'."
         )
 
-        df["Anonymized_Rapor"] = df["Rumpf"]
-        df["AccessionNo"] = (
-            df["AccNr"]
-            .astype(str)
-            .str.split("-", expand=True)[0]
-        )
 
     total_reports = len(df)
 
