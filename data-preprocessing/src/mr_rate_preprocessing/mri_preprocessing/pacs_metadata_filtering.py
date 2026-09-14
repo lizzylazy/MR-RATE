@@ -96,7 +96,7 @@ def load_csv(
     logger.info(f"Loading CSV: {csv_path.name}")
 
     # Peek at the header without loading the full file
-    available_columns: Set[str] = set(pd.read_csv(csv_path, nrows=0).columns)
+    available_columns: Set[str] = set(pd.read_csv(csv_path, nrows=0, sep=';').columns)
 
     # Validate required columns
     missing_required = set(required_columns) - available_columns
@@ -118,7 +118,7 @@ def load_csv(
 
     columns_to_load = required_columns + present_optional
 
-    df = pd.read_csv(csv_path, encoding="utf-8", low_memory=False, usecols=columns_to_load)
+    df = pd.read_csv(csv_path, encoding="utf-8", low_memory=False, usecols=columns_to_load, sep=';')
     logger.info(f"  Shape: {df.shape}  ({len(present_optional)} optional columns kept)")
 
     return df[columns_to_load].copy()
@@ -222,14 +222,16 @@ Example:
     parser.add_argument(
         "--input-csv", "-i",
         type=Path,
-        required=True,
+        #required=True,
+        default='/home/USZ/zhliracc/data/mr_rate/6445959_metadata/6445959_metadata.csv',
         help="CSV file containing raw PACS metadata"
     )
     
     parser.add_argument(
         "--output-csv", "-o",
         type=Path,
-        required=True,
+        #required=True,
+        default='/home/USZ/zhliracc/data/mr_rate/6445959_metadata/6445959_raw_metadata.csv',
         help="Output path for cleaned metadata CSV"
     )
     
