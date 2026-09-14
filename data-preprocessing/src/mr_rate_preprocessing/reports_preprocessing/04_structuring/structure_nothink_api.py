@@ -17,8 +17,8 @@ if __name__ == "__main__":
     # 0. CLI arguments 
     # =======================================================================
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_file", type=str, default='/data/zhliracc/data/mr_rate_data/translated_shards/translated_rank.csv')
-    parser.add_argument("--output_dir", type=str, default="/data/zhliracc/data/mr_rate_data/structure_shards")
+    parser.add_argument("--input_file", type=str, default='/home/USZ/zhliracc/data/mr_rate/6445959_metadata/translated_shards/translated_rank.csv')
+    parser.add_argument("--output_dir", type=str, default="/home/USZ/zhliracc/data/mr_rate/6445959_metadata/structure_shards")
     args = parser.parse_args()
 
     # =======================================================================
@@ -50,23 +50,23 @@ if __name__ == "__main__":
     # =======================================================================
     # 3. System Prompt — with /no_think to disable thinking
     # =======================================================================
-    system_prompt = """You are a medical radiology report structuring assistant. You will receive an English radiology report and must parse it into 4 structured sections. Do NOT omit or add any content — just parse and format.
+    system_prompt = """You are a medical radiology report structuring assistant. You will receive an English radiology report and must parse it into 5 structured sections. Do NOT omit or add any content — just parse and format.
 
 /no_think
 
 CRITICAL: NEVER use "..." or ellipsis as a placeholder in any field. You MUST include the FULL actual content for every section. If a section is empty in the original report, use an empty string "". But if content exists, you MUST include ALL of it.
 
 ## Your task:
-1. Parse the report into exactly 4 sections: clinical_information, technique, findings, impression.
+1. Parse the report into exactly 5 sections: question, clinical_information, technique, findings, impression.
 2. Keep ALL content. Do NOT remove any information.
 3. Normalize the formatting as specified below.
 
 ## Section extraction:
-- **clinical_information**: The clinical indication/history/reason for the exam. If none exists, use "".
-- **question**: Specific instruction or question a physician writes when sending a patient for a scan. If none exists, use "".
-- **technique**: The imaging technique, sequences, contrast info. Include ALL technique info (brain, cervical, thoracic, etc.). If none exists, use "".
-- **findings**: ALL observations from the report.
-- **impression**: ALL conclusions from the report.
+- **question**: Content under a header like "Indication:", "Clinical Question:", or similar — the physician's specific reason/question for the scan. If none exists, use "".
+- **clinical_information**: Content under a header like "Clinical Information:" or similar. If none exists, use "".
+- **technique**: The imaging technique, sequences, contrast info. If none exists, use "".
+- **findings**: ALL observations from the report body (everything between the technique/indication section and "Impression:").
+- **impression**: ALL conclusions, taken from content under "Impression:" or similar.
 
 ## Multi-section reports:
 Many reports cover multiple exams (e.g., "BRAIN MRI, CERVICAL AND THORACIC VERTEBRA MRI"). For these:
@@ -127,21 +127,20 @@ Many reports cover multiple exams (e.g., "BRAIN MRI, CERVICAL AND THORACIC VERTE
 - Remove standalone greeting lines, title lines, and trailing signatures that are outside the 4 sections.
 
 ## Output format:
-Return ONLY valid JSON, no preamble, no code fences.
+Return ONLY valid JSON, no preamble, no code fences, using exactly these keys:
 
-If the report contains valid radiology content:
-{"question": "...", "clinical_information": "...", "technique": "...", "findings": "...", "impression": "..."}
+{"question": "<content from question section, or empty string>", "clinical_information": "<content from Clinical Information section, or empty string>", "technique": "<technique text, or empty string>", "findings": "<findings text, or empty string>", "impression": "<impression bullet points, or empty string>"}
 
 If the report is garbage (empty, placeholder only, not a radiology report):
 {"invalid": true, "reason": "brief description"}
 
-CRITICAL: Output ONLY the JSON. Do NOT omit any content from the report."""
+CRITICAL: Output ONLY the JSON with the keys above. Replace each <...> placeholder with the real extracted text — never leave the literal placeholder, "...", "N/A", or any other filler in the output."""
 
     # =======================================================================
     # 4. Batched Processing
     # =======================================================================
     CHUNK_SIZE = 5
-    MAX_TOK = 2048
+    MAX_TOK = 30000
     sampling_params = SamplingParams(
         temperature=0.1,
         max_tokens=MAX_TOK,
@@ -190,19 +189,20 @@ CRITICAL: Output ONLY the JSON. Do NOT omit any content from the report."""
             "raw_report": raw_report,
         }
         if parsed is None:
-            return {**base, "clinical_information": "", "technique": "", "findings": "", "impression": "",
+            return {**base, "question": "","clinical_inf ormation": "", "technique": "", "findings": "", "impression": "",
                     "parse_status": "parse_failed", "invalid_reason": response[:200]}
         if parsed.get("invalid"):
-            return {**base, "clinical_information": "", "technique": "", "findings": "", "impression": "",
+            return {**base, "question": "", "clinical_information": "", "technique": "", "findings": "", "impression": "",
                     "parse_status": "invalid", "invalid_reason": parsed.get("reason", "")}
         if "findings" in parsed or "impression" in parsed:
             return {**base,
+                    "question": parsed.get("question", ""),
                     "clinical_information": parsed.get("clinical_information", ""),
                     "technique": parsed.get("technique", ""),
                     "findings": parsed.get("findings", ""),
                     "impression": fix_impression_bullets(parsed.get("impression", "")),
                     "parse_status": "ok", "invalid_reason": ""}
-        return {**base, "clinical_information": "", "technique": "", "findings": "", "impression": "",
+        return {**base, "question": "", "clinical_information": "", "technique": "", "findings": "", "impression": "",
                 "parse_status": "parse_failed", "invalid_reason": response[:200]}
 
     total_processed = 0
@@ -278,7 +278,7 @@ CRITICAL: Output ONLY the JSON. Do NOT omit any content from the report."""
                 retry_messages.append(messages)
 
             # Keep it as a dictionary so **retry_params unpacking works inside your script
-            retry_params = {"temperature": 0.0, "max_tokens": 2048}
+            retry_params = {"temperature": 0.0, "max_tokens": MAX_TOK}
 
             retry_outputs = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
