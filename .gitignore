@@ -12,9 +12,7 @@ coverage.xml
 wandb/
 
 # data-preprocessing: ignore data directory contents, keep placeholder files
-data-preprocessing/data/raw/*
-data-preprocessing/data/interim/*
-data-preprocessing/data/processed/*
+data-preprocessing/data/*
 !data-preprocessing/data/raw/.gitkeep
 !data-preprocessing/data/interim/.gitkeep
 !data-preprocessing/data/processed/.gitkeep
@@ -37,3 +35,4 @@ data-preprocessing/logs/*
 
 # macOS
 .DS_Store
+runs/
