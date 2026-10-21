@@ -10,7 +10,6 @@ Adapted from RAD-RATE fast_inference_new.py for brain MRI with:
 
 Usage:
     python inference.py \
-        --encoder vjepa2 \
         --weights_path ./mr_rate_results/MrRate.5000.pt \
         --data_folder /path/to/mri \
         --jsonl_file /path/to/findings_sentences.jsonl \
@@ -40,8 +39,8 @@ from accelerate import DistributedDataParallelKwargs
 
 from transformers import BertTokenizer, BertModel
 from mr_rate import MRRATE
+from vision_encoder import VJEPA2Encoder
 from data_inference import MRReportDatasetInfer, collate_fn_infer
-from extract_features import build_encoder, _load_and_verify
 from eval import evaluate_internal
 
 # ==============================================================================
@@ -393,14 +392,6 @@ class MrRateInference(nn.Module):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='MR-RATE Brain MRI Inference')
-    parser.add_argument('--encoder', type=str, default='vjepa2',
-                        choices=['vjepa2', 'vjepa21', 'vjepa2_sliding', 'vjepa21_sliding'],
-                        help='Vision encoder used to train the checkpoint')
-    parser.add_argument('--vjepa21_checkpoint', type=str, default=None,
-                        help='Optional VJEPA 2.1 pretrained .pt (not needed when the '
-                             'MR-RATE checkpoint already contains all encoder weights)')
-    parser.add_argument('--chunk_size', type=int, default=64,
-                        help='Depth chunk size for sliding encoders')
     parser.add_argument('--fusion_mode', type=str, required=True,
                         choices=['early', 'mid_cnn', 'late', 'late_attn'])
     parser.add_argument('--pooling_strategy', type=str, default='simple_attn',
@@ -457,7 +448,6 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"MR-RATE Brain MRI Inference")
     print(f"{'='*60}")
-    print(f"Encoder:          {args.encoder}")
     print(f"Fusion Mode:      {args.fusion_mode}")
     print(f"Pooling Strategy: {args.pooling_strategy}")
     print(f"Splits CSV:       {args.splits_csv}")
@@ -465,24 +455,35 @@ if __name__ == "__main__":
     print(f"Normalizer:       {args.normalizer}")
     print(f"{'='*60}\n")
 
-    # Initialize model (same encoder selection as run_train.py / extract_features.py)
-    print(f"--- Initializing {args.encoder} Image Encoder + MR-RATE Model ---")
-    args.dim_latent = 512
-    args.extra_latent_projection = False
-    clip, _ = build_encoder(args)
-    image_encoder = clip.visual_transformer
+    # Initialize model
+    print("--- Initializing VJEPA2 Image Encoder ---")
+    image_encoder = VJEPA2Encoder(
+        input_channels=(3 if args.fusion_mode == "early" else 1),
+        freeze_backbone=True,
+        use_lora=True,
+        lora_r=32,
+        lora_alpha=64,
+    )
 
-    # Verified load: aborts if the checkpoint does not match the encoder
-    # (MRRATE.load alone uses strict=False and would silently skip keys).
+    print("\n--- Initializing MR-RATE Model ---")
+    clip = MRRATE(
+        image_encoder=image_encoder,
+        dim_image=image_encoder.output_dim,
+        dim_text=768,
+        dim_latent=512,
+        fusion_mode=args.fusion_mode,
+        pooling_strategy=args.pooling_strategy,
+        use_gradient_checkpointing=False,
+    ).cuda()
+
     print(f"Loading weights: {args.weights_path}")
-    _load_and_verify(clip, args.weights_path)
+    clip.load(args.weights_path)
 
-    # Merge LoRA for speed (HF VJEPA2 wraps .model, VJEPA 2.1 wraps .encoder)
+    # Merge LoRA for speed
     print("Merging LoRA weights...")
     try:
-        lora_module = getattr(image_encoder, "model", None) or getattr(image_encoder, "encoder", None)
-        if hasattr(lora_module, "merge_and_unload"):
-            lora_module.merge_and_unload()
+        if hasattr(image_encoder, "model") and hasattr(image_encoder.model, "merge_and_unload"):
+            image_encoder.model.merge_and_unload()
             print("LoRA merged successfully.")
     except Exception as e:
         print(f"LoRA merge skipped: {e}")
