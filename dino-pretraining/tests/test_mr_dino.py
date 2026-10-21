@@ -9,24 +9,24 @@ from mr_dino.data import (
     CACHE_MANIFEST_NAME,
     CropSpec,
     InfiniteStudySampler,
-    MRAtlasDINO3DDataset,
+    MRAlignedDINO3DDataset,
     _raw_volume,
     _contained_start,
     _intersection_box,
     collate_dino3d,
-    discover_raw_atlas,
+    discover_raw_aligned,
     previous_mr_data_module,
-    validate_atlas_cache,
+    validate_aligned_cache,
 )
 
 
-def make_dummy_cache(root, studies=4, shape=(8, 32, 32)):
-    space = root / "atlas_space"
+def make_dummy_cache(root, studies=4, shape=(8, 32, 32), space_name="coreg_space"):
+    space = root / space_name
     space.mkdir(parents=True)
     manifest = {
         "version": 1,
         "layout": "per_subject_stack",
-        "space": "atlas_space",
+        "space": space_name,
         "target_spacing": [1.0, 0.5, 0.5],
         "target_shape": list(shape),
         "posterior_shift_mm": 15.0,
@@ -49,7 +49,7 @@ def make_dummy_cache(root, studies=4, shape=(8, 32, 32)):
 
 
 def tiny_dataset(cache, seed=17):
-    return MRAtlasDINO3DDataset(
+    return MRAlignedDINO3DDataset(
         preprocessed_dir=str(cache),
         crop_spec=CropSpec(
             global_shape=(8, 32, 32),
@@ -62,40 +62,42 @@ def tiny_dataset(cache, seed=17):
     )
 
 
-def test_cache_contract_rejects_non_atlas(tmp_path):
+def test_cache_contract_rejects_other_space(tmp_path):
     cache = make_dummy_cache(tmp_path / "cache")
-    assert validate_atlas_cache(str(cache))["space"] == "atlas_space"
-    manifest_path = cache / "atlas_space" / CACHE_MANIFEST_NAME
+    assert validate_aligned_cache(str(cache))["space"] == "coreg_space"
+    with pytest.raises(FileNotFoundError):
+        validate_aligned_cache(str(cache), space="atlas_space")   # coreg cache, atlas requested
+    manifest_path = cache / "coreg_space" / CACHE_MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text())
     manifest["space"] = "native_space"
     manifest_path.write_text(json.dumps(manifest))
-    with pytest.raises(ValueError, match="expected 'atlas_space'"):
-        validate_atlas_cache(str(cache))
+    with pytest.raises(ValueError, match="expected 'coreg_space'"):
+        validate_aligned_cache(str(cache))
 
 
-def test_cache_contract_rejects_coreg_space_argument(tmp_path):
+def test_native_space_is_rejected(tmp_path):
     cache = make_dummy_cache(tmp_path / "cache")
-    with pytest.raises(ValueError, match="requires space='atlas_space'"):
-        validate_atlas_cache(str(cache), space="coreg_space")
+    with pytest.raises(ValueError, match="requires an aligned space"):
+        validate_aligned_cache(str(cache), space="native_space")
+    with pytest.raises(ValueError, match="requires an aligned space"):
+        discover_raw_aligned(str(tmp_path), space="native_space")
 
 
-def test_raw_discovery_selects_atlas_img_not_coreg_img(tmp_path):
-    atlas_dir = tmp_path / "batch00" / "study_atlas" / "atlas_img"
-    atlas_dir.mkdir(parents=True)
-    (atlas_dir / "t1.nii.gz").touch()
-    (atlas_dir / "flair.nii.gz").touch()
-    coreg_dir = tmp_path / "batch00" / "study_coreg" / "coreg_img"
-    coreg_dir.mkdir(parents=True)
-    (coreg_dir / "t1.nii.gz").touch()
-
-    samples = discover_raw_atlas(str(tmp_path), selected=None)
-    assert [sample["study_uid"] for sample in samples] == ["study_atlas"]
-    assert samples[0]["n_sequences"] == 2
+def test_raw_discovery_selects_requested_space_folder(tmp_path):
+    for name, sub, files in (("study_a", "atlas_img", 1), ("study_c", "coreg_img", 2), ("study_n", "img", 3)):
+        folder = tmp_path / "batch00" / name / sub
+        folder.mkdir(parents=True)
+        for i in range(files):
+            (folder / f"seq{i}.nii.gz").touch()
+    coreg = discover_raw_aligned(str(tmp_path), selected=None)   # default space is coreg
+    assert [(s["study_uid"], s["n_sequences"]) for s in coreg] == [("study_c", 2)]
+    atlas = discover_raw_aligned(str(tmp_path), selected=None, space="atlas_space")
+    assert [(s["study_uid"], s["n_sequences"]) for s in atlas] == [("study_a", 1)]
 
 
 def test_raw_transform_is_exact_previous_mil_transform(tmp_path):
     nib = pytest.importorskip("nibabel")
-    image_dir = tmp_path / "batch00" / "study" / "atlas_img"
+    image_dir = tmp_path / "batch00" / "study" / "coreg_img"
     image_dir.mkdir(parents=True)
     x, y, z = np.indices((12, 14, 6), dtype=np.float32)
     array = np.sin(x / 3) + np.cos(y / 4) + z / 7
@@ -124,10 +126,11 @@ def test_aligned_cross_sequence_views_and_determinism(tmp_path):
     assert torch.equal(first["teacher_global"], again["teacher_global"])
     assert first["teacher_global"].shape == (2, 1, 8, 32, 32)
     assert first["student_local"].shape == (2, 1, 4, 16, 16)
-    lo, hi = _intersection_box(first["global_starts"], (8, 32, 32))
-    for start in first["local_starts"]:
-        for s, n, left, right in zip(start, (4, 16, 16), lo, hi):
-            assert left <= s and s + n <= right
+    for start in first["local_starts"]:   # each local crop lies inside one of the two globals
+        assert any(
+            all(g <= s and s + n <= g + G for s, n, g, G in zip(start, (4, 16, 16), parent, (8, 32, 32)))
+            for parent in first["global_starts"]
+        )
 
 
 def test_collate_masks_match_patch_grid(tmp_path):
@@ -198,3 +201,86 @@ def test_synthetic_forward_backward_and_checkpoint(tmp_path):
     learner.load_state_dict(saved["model"])
     optimizer.load_state_dict(saved["optimizer"])
     assert saved["step"] == 1
+
+
+
+# --------------------------------------------------------------------------- Sinkhorn count
+def _reference_sinkhorn_single_process(logits, temperature, iterations=3):
+    """Plain (non-distributed) Sinkhorn over ALL tokens: the definition the distributed version must match."""
+    q = torch.exp((logits.float() - logits.float().max()) / temperature).t()
+    global_batch, prototypes = q.shape[1], q.shape[0]
+    q /= q.sum().clamp_min(1e-12)
+    for _ in range(iterations):
+        q /= q.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        q /= prototypes
+        q /= q.sum(dim=0, keepdim=True).clamp_min(1e-12)
+        q /= global_batch
+    return (q * global_batch).t()
+
+
+def _legacy_sinkhorn(logits, temperature, world, iterations=3):
+    """The historical implementation (local rows x world size denominator) for equal-count parity."""
+    import torch.distributed as dist
+    max_logit = logits.detach().float().max()
+    if dist.is_initialized():
+        dist.all_reduce(max_logit, op=dist.ReduceOp.MAX)
+    q = torch.exp((logits.float() - max_logit) / temperature).t()
+    global_batch = q.shape[1] * world
+    prototypes = q.shape[0]
+    total = q.sum()
+    if dist.is_initialized():
+        dist.all_reduce(total)
+    q /= total.clamp_min(1e-12)
+    for _ in range(iterations):
+        rows = q.sum(dim=1, keepdim=True)
+        if dist.is_initialized():
+            dist.all_reduce(rows)
+        q /= rows.clamp_min(1e-12)
+        q /= prototypes
+        q /= q.sum(dim=0, keepdim=True).clamp_min(1e-12)
+        q /= global_batch
+    return (q * global_batch).t()
+
+
+def test_sinkhorn_single_process_matches_legacy_and_rejects_empty():
+    from mr_dino.objective import distributed_sinkhorn
+    torch.manual_seed(0)
+    logits = torch.randn(23, 7)
+    torch.testing.assert_close(distributed_sinkhorn(logits, 0.07), _legacy_sinkhorn(logits, 0.07, 1), atol=0, rtol=0)
+    with pytest.raises(ValueError):
+        distributed_sinkhorn(torch.zeros(0, 7), 0.07)
+
+
+def _sinkhorn_worker(rank, rendezvous):
+    import torch.distributed as dist
+    from datetime import timedelta
+    from mr_dino.objective import distributed_sinkhorn
+    torch.set_num_threads(1)
+    dist.init_process_group("gloo", init_method="file://" + rendezvous, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=60))
+    try:
+        torch.manual_seed(11)
+        logits = torch.randn(30, 9) * 3
+        # Equal local counts: corrected == legacy bit for bit.
+        local = logits[rank * 15:(rank + 1) * 15]
+        torch.testing.assert_close(distributed_sinkhorn(local, 0.07), _legacy_sinkhorn(local, 0.07, 2), atol=0, rtol=0)
+        # Unequal local counts (masked tokens): corrected == single-process over all tokens; legacy differs.
+        for split in (7, 0, 30):
+            local = logits[:split] if rank == 0 else logits[split:]
+            got = distributed_sinkhorn(local, 0.07)
+            expected = _reference_sinkhorn_single_process(logits, 0.07)
+            expected_local = expected[:split] if rank == 0 else expected[split:]
+            assert got.shape == local.shape and got.dtype == torch.float32
+            torch.testing.assert_close(got, expected_local, atol=1e-6, rtol=1e-5)
+            if split == 7:
+                legacy = _legacy_sinkhorn(local, 0.07, 2)
+                assert not torch.allclose(legacy, expected_local, atol=1e-6, rtol=1e-5)
+        # Globally empty raises on both ranks.
+        with pytest.raises(ValueError):
+            distributed_sinkhorn(torch.zeros(0, 9), 0.07)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_sinkhorn_uses_actual_global_token_count_across_ranks(tmp_path):
+    torch.multiprocessing.spawn(_sinkhorn_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
